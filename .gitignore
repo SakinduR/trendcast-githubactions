@@ -1,0 +1,65 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# Airflow
+airflow/logs/
+airflow/airflow.db
+airflow/airflow-webserver.pid
+airflow/standalone_admin_password.txt
+
+# Spark
+spark-warehouse/
+metastore_db/
+derby.log
+*.log
+
+# Data artifacts (local extracts and processed output)
+data/
+output/
+*.parquet
+*.csv
+*.jsonl
+
+# Docker
+.docker/
+
+# Certificates and private keys
+*.key
+*.p12
+*.pfx
+certificates/*.pem
+
+# IDE and OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
