@@ -42,6 +42,7 @@ derby.log
 # Data artifacts (local extracts and processed output)
 data/
 output/
+postgres_data/
 *.parquet
 *.csv
 *.jsonl

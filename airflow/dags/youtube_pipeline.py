@@ -31,14 +31,17 @@ REQUEST_DELAY_SECONDS = 0.5
 
 CREATE_CHANNEL_STATS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS channel_stats (
-    channel_id VARCHAR(64) PRIMARY KEY,
-    channel_title TEXT NOT NULL,
+    channel_id VARCHAR(255) PRIMARY KEY,
+    channel_title TEXT,
     channel_description TEXT,
     total_views BIGINT,
     subscriber_count BIGINT,
     video_count BIGINT,
-    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_channel_stats_processed_at
+    ON channel_stats (processed_at DESC);
 """
 
 UPSERT_CHANNEL_STATS_SQL = """
