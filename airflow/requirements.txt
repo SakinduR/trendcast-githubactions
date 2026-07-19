@@ -1,7 +1,24 @@
-# Additional Python packages for the Airflow container.
-# The base Airflow image already includes apache-airflow; only add extras here.
-# Installed during Docker build via: pip install -r requirements.txt
+# =============================================================================
+# Airflow Python Dependencies
+# =============================================================================
 
-apache-airflow-providers-postgres==5.13.1
-requests==2.32.3
-psycopg2-binary==2.9.10
+# Apache Airflow providers
+apache-airflow-providers-postgres==5.10.0
+apache-airflow-providers-http==4.9.0
+
+# Google YouTube Data API v3
+google-api-python-client==2.120.0
+google-auth==2.28.2
+google-auth-httplib2==0.2.0
+
+# Kafka producer
+kafka-python==2.0.2
+
+# HTTP requests
+requests==2.31.0
+
+# Data manipulation
+pandas==2.2.1
+
+# PostgreSQL adapter (psycopg2 compiled binary for portability)
+psycopg2-binary==2.9.9
