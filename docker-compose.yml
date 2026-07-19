@@ -1,162 +1,339 @@
 # =============================================================================
-# YouTube Data Pipeline - Docker Compose
-# Location: youtube-pipeline/docker-compose.yml (project root)
-# =============================================================================
-# Usage:
-#   docker compose up --build -d
-#   docker compose logs -f airflow-webserver
+# YouTube ETL Pipeline — Docker Compose Orchestration
+# Version: 3.8
+# Services: PostgreSQL, Airflow (Webserver + Scheduler + Init),
+#           Spark (Master + Worker), Kafka + Zookeeper,
+#           Jupyter DataScience Notebook, YouTube Extractor
 # =============================================================================
 
-x-airflow-common: &airflow-common
-  build:
-    context: ./airflow
-    dockerfile: Dockerfile
-  image: youtube-pipeline-airflow:2.10.5
-  env_file:
-    - .env
-  environment: &airflow-common-env
-    AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR:-LocalExecutor}
-    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
-    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-    AIRFLOW_CONN_YOUTUBE_POSTGRES: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
-    _PIP_ADDITIONAL_REQUIREMENTS: ""
-  volumes:
-    - ./airflow/dags:/opt/airflow/dags
-    - ./airflow/logs:/opt/airflow/logs
-    - ./airflow/plugins:/opt/airflow/plugins
-  user: "${AIRFLOW_UID:-50000}:0"
-  networks:
-    - youtube-pipeline-network
-  depends_on:
-    postgres:
-      condition: service_healthy
+# ---------------------------------------------------------------------------
+# Named Volumes — persistent data storage across container restarts
+# ---------------------------------------------------------------------------
+volumes:
+  postgres_data:
+    driver: local
+  airflow_logs:
+    driver: local
+  jupyter_data:
+    driver: local
 
+# ---------------------------------------------------------------------------
+# Custom bridge network — all services communicate via service names as DNS
+# ---------------------------------------------------------------------------
+networks:
+  pipeline_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# ===========================================================================
+# SERVICE DEFINITIONS
+# ===========================================================================
 services:
-  # ---------------------------------------------------------------------------
-  # PostgreSQL - metadata store for Airflow and pipeline data target
-  # ---------------------------------------------------------------------------
+
+  # -------------------------------------------------------------------------
+  # 1. PostgreSQL 13 — Primary data store
+  # -------------------------------------------------------------------------
   postgres:
-    image: postgres:13
-    container_name: youtube-pipeline-postgres
-    env_file:
-      - .env
+    image: postgres:13-alpine
+    container_name: yt_postgres
+    restart: unless-stopped
+    env_file: .env
     environment:
+      POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      PGDATA: /var/lib/postgresql/data/pgdata
     ports:
-      - "5433:5432"
+      - "${POSTGRES_EXTERNAL_PORT:-5433}:5432"
     volumes:
+      # Persistent data volume
       - ./postgres_data:/var/lib/postgresql/data
+      # Initialization SQL scripts (optional — runs once on first boot)
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - youtube-pipeline-network
-    restart: unless-stopped
-
-  # ---------------------------------------------------------------------------
-  # Airflow init - database migration and admin user bootstrap (runs once)
-  # ---------------------------------------------------------------------------
-  airflow-init:
-    <<: *airflow-common
-    container_name: youtube-pipeline-airflow-init
-    entrypoint: /bin/bash
-    command:
-      - -c
-      - |
-        airflow db migrate
-        airflow users create \
-          --username "${AIRFLOW_ADMIN_USERNAME:-admin}" \
-          --password "${AIRFLOW_ADMIN_PASSWORD:-admin}" \
-          --firstname Admin \
-          --lastname User \
-          --role Admin \
-          --email "${AIRFLOW_ADMIN_EMAIL:-admin@example.com}" || true
-    environment:
-      <<: *airflow-common-env
-      _AIRFLOW_DB_MIGRATE: "true"
-      _AIRFLOW_WWW_USER_CREATE: "true"
-    restart: "no"
-
-  # ---------------------------------------------------------------------------
-  # Airflow webserver - UI and REST API
-  # ---------------------------------------------------------------------------
-  airflow-webserver:
-    <<: *airflow-common
-    container_name: youtube-pipeline-airflow-webserver
-    command: webserver
-    ports:
-      - "${AIRFLOW_WEBSERVER_PORT:-8080}:8080"
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
+      retries: 10
       start_period: 30s
+    networks:
+      - pipeline_net
+
+  # -------------------------------------------------------------------------
+  # 2. Apache Airflow — One-time DB Init & User Creation
+  # -------------------------------------------------------------------------
+  airflow-init:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: yt_airflow_init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    # Run migrations then create admin user; exit 0 ensures it doesn't block
+    entrypoint: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create
+          --username $${_AIRFLOW_WWW_USER_USERNAME}
+          --password $${_AIRFLOW_WWW_USER_PASSWORD}
+          --firstname Admin
+          --lastname User
+          --role Admin
+          --email admin@example.com || true
+      "
+    networks:
+      - pipeline_net
+
+  # -------------------------------------------------------------------------
+  # 3. Apache Airflow — Scheduler
+  # -------------------------------------------------------------------------
+  airflow-scheduler:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: yt_airflow_scheduler
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
-    restart: unless-stopped
-
-  # ---------------------------------------------------------------------------
-  # Airflow scheduler - DAG execution engine
-  # ---------------------------------------------------------------------------
-  airflow-scheduler:
-    <<: *airflow-common
-    container_name: youtube-pipeline-airflow-scheduler
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      YOUTUBE_API_KEY: ${YOUTUBE_API_KEY}
+      YOUTUBE_CHANNEL_IDS: ${YOUTUBE_CHANNEL_IDS}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
     command: scheduler
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 30s
+    networks:
+      - pipeline_net
+
+  # -------------------------------------------------------------------------
+  # 4. Apache Airflow — Webserver (UI)
+  # -------------------------------------------------------------------------
+  airflow-webserver:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: yt_airflow_webserver
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
-    restart: unless-stopped
+      airflow-scheduler:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    command: webserver
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - pipeline_net
 
-  # ---------------------------------------------------------------------------
-  # Jupyter notebook server - analysis and visualization workspace
-  # ---------------------------------------------------------------------------
+  # -------------------------------------------------------------------------
+  # 5. Apache Zookeeper — Required for Kafka coordination
+  # -------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: yt_zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 2
+    ports:
+      - "2181:2181"
+    healthcheck:
+      # cub (Confluent Utility Belt) is pre-installed in all Confluent images
+      # and is the recommended way to check Zookeeper readiness
+      test: ["CMD", "cub", "zk-ready", "localhost:2181", "30"]
+      interval: 15s
+      timeout: 35s
+      retries: 5
+      start_period: 45s
+    networks:
+      - pipeline_net
+
+  # -------------------------------------------------------------------------
+  # 6. Apache Kafka — Message broker for streaming ingestion
+  # -------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: yt_kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: ${KAFKA_BROKER_ID:-1}
+      KAFKA_ZOOKEEPER_CONNECT: ${KAFKA_ZOOKEEPER_CONNECT}
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: ${KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR:-1}
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168        # 7-day retention
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824   # 1GB segments
+    ports:
+      - "9092:9092"
+      - "29092:29092"   # Host-accessible listener for local dev
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - pipeline_net
+
+  # -------------------------------------------------------------------------
+  # 7. Apache Spark Master
+  # -------------------------------------------------------------------------
+  spark-master:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: yt_spark_master
+    restart: unless-stopped
+    # Official apache/spark image uses spark-class to start master/worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_PORT: 7077
+      SPARK_MASTER_WEBUI_PORT: 8080
+    ports:
+      - "7077:7077"   # Spark master port
+      - "8081:8080"   # Spark master Web UI
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080 || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 30s
+    networks:
+      - pipeline_net
+
+  # -------------------------------------------------------------------------
+  # 8. Apache Spark Worker
+  # -------------------------------------------------------------------------
+  spark-worker:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: yt_spark_worker
+    restart: unless-stopped
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    # Connect to master using spark:// URL
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2g}
+      SPARK_WORKER_WEBUI_PORT: 8081
+    ports:
+      - "8082:8081"   # Spark worker Web UI
+    networks:
+      - pipeline_net
+
+  # -------------------------------------------------------------------------
+  # 9. Jupyter DataScience Notebook — Interactive analysis environment
+  # -------------------------------------------------------------------------
   jupyter:
     build:
       context: ./jupyter
       dockerfile: Dockerfile
-    container_name: youtube-pipeline-jupyter
-    env_file:
-      - .env
-    environment:
-      JUPYTER_TOKEN: ${JUPYTER_TOKEN:-password}
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    ports:
-      - "${JUPYTER_PORT:-8888}:8888"
-    volumes:
-      - ./jupyter/notebooks:/home/jovyan/work
+    container_name: yt_jupyter
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
+    env_file: .env
+    environment:
+      JUPYTER_ENABLE_LAB: ${JUPYTER_ENABLE_LAB:-yes}
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./jupyter/notebooks:/home/jovyan/work
     networks:
-      - youtube-pipeline-network
-    restart: unless-stopped
+      - pipeline_net
 
-networks:
-  youtube-pipeline-network:
-    name: youtube-pipeline-network
-    driver: bridge
+  # -------------------------------------------------------------------------
+  # 10. YouTube Extractor — Custom Python extractor service
+  # -------------------------------------------------------------------------
+  youtube-extractor:
+    build:
+      context: ./youtube_extractor
+      dockerfile: Dockerfile
+    container_name: yt_extractor
+    restart: "no"     # Run once; Airflow triggers subsequent runs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      YOUTUBE_API_KEY: ${YOUTUBE_API_KEY}
+      YOUTUBE_CHANNEL_IDS: ${YOUTUBE_CHANNEL_IDS}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC_YOUTUBE_RAW:-youtube_raw_data}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    networks:
+      - pipeline_net
