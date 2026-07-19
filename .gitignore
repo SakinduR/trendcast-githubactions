@@ -1,7 +1,20 @@
-# Environment and secrets
+# =============================================================================
+# .gitignore — YouTube ETL Pipeline
+# =============================================================================
+
+# Environment — NEVER commit secrets
 .env
-.env.*
-!.env.example
+*.env
+.env.local
+.env.*.local
+
+# PostgreSQL persistent data
+postgres_data/
+
+# Airflow auto-generated directories
+airflow/logs/
+airflow/plugins/
+airflow/__pycache__/
 
 # Python
 __pycache__/
@@ -9,58 +22,34 @@ __pycache__/
 *$py.class
 *.so
 .Python
-.venv/
-venv/
-env/
-*.egg-info/
-.eggs/
 dist/
 build/
-*.egg
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
+*.egg-info/
+.eggs/
 
 # Jupyter
 .ipynb_checkpoints/
-*.nbconvert.ipynb
+jupyter/notebooks/*.csv
+jupyter/notebooks/*.png
 
-# Airflow
-airflow/logs/
-airflow/airflow.db
-airflow/airflow-webserver.pid
-airflow/standalone_admin_password.txt
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
 
-# Spark
-spark-warehouse/
-metastore_db/
-derby.log
-*.log
-
-# Data artifacts (local extracts and processed output)
-data/
-output/
-postgres_data/
-*.parquet
-*.csv
-*.jsonl
+# macOS
+.DS_Store
 
 # Docker
-.docker/
+*.log
 
-# Certificates and private keys
-*.key
-*.p12
-*.pfx
-certificates/*.pem
-
-# IDE and OS
-.idea/
+# IDE
 .vscode/
+.idea/
 *.swp
 *.swo
-.DS_Store
-Thumbs.db
-desktop.ini
+
+# Spark checkpoints
+spark-checkpoints/
+/tmp/
