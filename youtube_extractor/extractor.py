@@ -1,9 +1,23 @@
-#!/usr/bin/env python3
 """
-YouTube Data Extraction Module
+================================================================================
+extractor.py — YouTube Channel Statistics Extractor
+================================================================================
+Responsibilities:
+  1. Fetch channel statistics from the YouTube Data API v3.
+  2. Publish raw JSON records to a Kafka topic (streaming mode).
+  3. Optionally upsert records directly to PostgreSQL (batch mode).
 
-Fetches channel metadata from the YouTube Data API v3 and optionally persists
-results to PostgreSQL. Runs standalone via CLI or can be imported by Airflow/Spark.
+Environment Variables Required:
+  YOUTUBE_API_KEY         — YouTube Data API v3 key
+  YOUTUBE_CHANNEL_IDS     — Comma-separated channel IDs
+  KAFKA_BOOTSTRAP_SERVERS — e.g. kafka:9092
+  KAFKA_TOPIC             — Target Kafka topic name
+  POSTGRES_HOST / PORT / DB / USER / PASSWORD — DB connection params
+
+Usage:
+  python extractor.py                   # Kafka streaming mode (default)
+  python extractor.py --mode=postgres   # Direct PostgreSQL upsert mode
+================================================================================
 """
 
 from __future__ import annotations
@@ -14,475 +28,524 @@ import logging
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable, Sequence
+from typing import Any, Dict, List, Optional
 
 import psycopg2
 import psycopg2.extras
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from dotenv import load_dotenv
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from kafka import KafkaProducer
+from kafka.errors import KafkaError
+from pythonjsonlogger import jsonlogger
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Load environment variables from .env (only for local dev; Docker sets them)
+# ---------------------------------------------------------------------------
+load_dotenv()
 
-YOUTUBE_CHANNELS_URL = "https://www.googleapis.com/youtube/v3/channels"
-MAX_CHANNELS_PER_REQUEST = 50
-DEFAULT_REQUEST_DELAY_SECONDS = 0.5
-DEFAULT_MAX_RETRIES = 5
-DEFAULT_BACKOFF_FACTOR = 1.0
-
-
-@dataclass(frozen=True)
-class ChannelData:
-    """Normalized channel record from the YouTube Data API."""
-
-    channel_id: str
-    title: str
-    description: str
-    view_count: int | None
-    subscriber_count: int | None
-    video_count: int | None
-    extracted_at: str
-
-
-class YouTubeExtractorError(Exception):
-    """Base exception for extractor failures."""
-
-
-class QuotaExceededError(YouTubeExtractorError):
-    """Raised when the YouTube API daily quota is exhausted."""
-
-
-class RateLimitError(YouTubeExtractorError):
-    """Raised when the YouTube API rate limit is hit."""
+# ---------------------------------------------------------------------------
+# Structured JSON logging — integrates cleanly with log aggregators
+# ---------------------------------------------------------------------------
+logger = logging.getLogger("youtube_extractor")
+logger.setLevel(logging.INFO)
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(
+    jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+    )
+)
+logger.addHandler(_handler)
 
 
-class YouTubeAPIError(YouTubeExtractorError):
-    """Raised for non-recoverable YouTube API errors."""
+# ===========================================================================
+# Configuration — read from environment, fail fast if required keys missing
+# ===========================================================================
+class Config:
+    """Centralises all configuration and validates required values on startup."""
 
-
-def _parse_int(value: str | None) -> int | None:
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _chunked(items: Sequence[str], size: int) -> Iterable[list[str]]:
-    for index in range(0, len(items), size):
-        yield list(items[index : index + size])
-
-
-class YouTubeExtractor:
-    """Client for retrieving YouTube channel metadata."""
-
-    def __init__(
-        self,
-        api_key: str,
-        *,
-        request_delay_seconds: float = DEFAULT_REQUEST_DELAY_SECONDS,
-        max_retries: int = DEFAULT_MAX_RETRIES,
-        backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
-        timeout_seconds: int = 30,
-    ) -> None:
-        if not api_key or api_key == "your_youtube_api_key_here":
-            raise ValueError("A valid YOUTUBE_API_KEY must be provided.")
-
-        self.api_key = api_key
-        self.request_delay_seconds = request_delay_seconds
-        self.timeout_seconds = timeout_seconds
-        self.request_count = 0
-        self.estimated_quota_units = 0
-
-        retry_strategy = Retry(
-            total=max_retries,
-            connect=max_retries,
-            read=max_retries,
-            status=max_retries,
-            backoff_factor=backoff_factor,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset(["GET"]),
-            raise_on_status=False,
+    def __init__(self) -> None:
+        self.api_key: str = self._require("YOUTUBE_API_KEY")
+        self.channel_ids: List[str] = [
+            cid.strip()
+            for cid in self._require("YOUTUBE_CHANNEL_IDS").split(",")
+            if cid.strip()
+        ]
+        self.kafka_servers: str = os.getenv(
+            "KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"
         )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session = requests.Session()
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
+        self.kafka_topic: str = os.getenv(
+            "KAFKA_TOPIC", "youtube_raw_data"
+        )
+        self.pg_host: str = os.getenv("POSTGRES_HOST", "postgres")
+        self.pg_port: int = int(os.getenv("POSTGRES_PORT", "5432"))
+        self.pg_db: str = os.getenv("POSTGRES_DB", "youtube_pipeline")
+        self.pg_user: str = os.getenv("POSTGRES_USER", "airflow")
+        self.pg_password: str = os.getenv("POSTGRES_PASSWORD", "")
+        # YouTube API max channel IDs per request
+        self.api_batch_size: int = 50
+        # Quota cost per channels.list call = 1 unit
+        # Daily quota: 10,000 units → can make 10,000 calls/day
+        self.quota_delay_seconds: float = float(
+            os.getenv("QUOTA_DELAY_SECONDS", "0.1")
+        )
 
-    def fetch_channels(self, channel_ids: Sequence[str]) -> list[ChannelData]:
-        """Fetch metadata for one or more channel IDs."""
-        normalized_ids = _normalize_channel_ids(channel_ids)
-        if not normalized_ids:
-            raise ValueError("At least one YouTube channel ID is required.")
+    @staticmethod
+    def _require(key: str) -> str:
+        value = os.getenv(key)
+        if not value:
+            logger.error("Required environment variable missing", extra={"key": key})
+            sys.exit(1)
+        return value
 
-        logger.info("Fetching metadata for %d channel(s)", len(normalized_ids))
-        results: list[ChannelData] = []
 
-        for batch_index, batch in enumerate(
-            _chunked(normalized_ids, MAX_CHANNELS_PER_REQUEST), start=1
-        ):
-            logger.debug(
-                "Processing batch %d with %d channel ID(s)", batch_index, len(batch)
-            )
-            batch_results = self._fetch_channel_batch(batch)
-            results.extend(batch_results)
+# ===========================================================================
+# YouTubeAPIClient — wraps google-api-python-client with retry logic
+# ===========================================================================
+class YouTubeAPIClient:
+    """
+    Thin wrapper around the YouTube Data API v3.
 
-            if batch_index * MAX_CHANNELS_PER_REQUEST < len(normalized_ids):
-                logger.debug(
-                    "Sleeping %.2fs before next API request to reduce burst load",
-                    self.request_delay_seconds,
-                )
-                time.sleep(self.request_delay_seconds)
+    Quota Management:
+    - channels.list costs 1 quota unit.
+    - Default daily quota: 10,000 units.
+    - We batch up to 50 IDs per request to minimise quota usage.
+    - Exponential back-off on transient errors (5xx, 429).
+    """
 
-        found_ids = {record.channel_id for record in results}
-        missing_ids = set(normalized_ids) - found_ids
-        if missing_ids:
-            logger.warning(
-                "No data returned for channel ID(s): %s",
-                ", ".join(sorted(missing_ids)),
-            )
+    # Parts to request — avoid requesting unnecessary parts to save quota
+    CHANNEL_PARTS = "snippet,statistics"
+
+    def __init__(self, api_key: str) -> None:
+        self._service = build(
+            "youtube", "v3", developerKey=api_key, cache_discovery=False
+        )
+        logger.info("YouTube API client initialised")
+
+    @retry(
+        retry=retry_if_exception_type(HttpError),
+        wait=wait_exponential(multiplier=1, min=4, max=60),
+        stop=stop_after_attempt(5),
+        reraise=True,
+    )
+    def fetch_channel_statistics(
+        self, channel_ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch statistics for up to 50 channel IDs in a single API call.
+
+        Args:
+            channel_ids: List of YouTube channel ID strings.
+
+        Returns:
+            List of normalised channel stat dictionaries.
+
+        Raises:
+            HttpError: On non-retryable API errors (e.g. 403 quota exceeded).
+        """
+        if not channel_ids:
+            return []
 
         logger.info(
-            "Completed extraction: %d record(s), %d API request(s), ~%d quota unit(s)",
-            len(results),
-            self.request_count,
-            self.estimated_quota_units,
+            "Fetching channel stats",
+            extra={"channel_count": len(channel_ids)},
         )
-        return results
 
-    def _fetch_channel_batch(self, channel_ids: list[str]) -> list[ChannelData]:
-        params = {
-            "part": "snippet,statistics",
-            "id": ",".join(channel_ids),
-            "key": self.api_key,
+        try:
+            response = (
+                self._service.channels()
+                .list(
+                    part=self.CHANNEL_PARTS,
+                    id=",".join(channel_ids),
+                    maxResults=50,
+                )
+                .execute()
+            )
+        except HttpError as exc:
+            status_code = exc.resp.status
+            if status_code == 403:
+                logger.error(
+                    "YouTube API quota exceeded or access forbidden",
+                    extra={"status_code": status_code, "details": str(exc)},
+                )
+                raise  # Do not retry quota exhaustion — re-raise immediately
+            elif status_code in (500, 502, 503, 504):
+                logger.warning(
+                    "Transient API error — will retry",
+                    extra={"status_code": status_code},
+                )
+                raise  # Retryable — tenacity will back off
+            else:
+                logger.error(
+                    "Non-retryable API error",
+                    extra={"status_code": status_code, "details": str(exc)},
+                )
+                raise
+
+        items = response.get("items", [])
+        return [self._normalise(item) for item in items]
+
+    @staticmethod
+    def _normalise(item: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Flatten a raw YouTube API channel item into a clean dict.
+
+        Args:
+            item: Raw API response item dict.
+
+        Returns:
+            Normalised dict with typed fields.
+        """
+        snippet = item.get("snippet", {})
+        stats = item.get("statistics", {})
+
+        return {
+            "channel_id": item.get("id", ""),
+            "channel_title": snippet.get("title", ""),
+            "channel_description": snippet.get("description", ""),
+            "published_at": snippet.get("publishedAt", ""),
+            "country": snippet.get("country", ""),
+            "total_views": int(stats.get("viewCount", 0)),
+            "subscriber_count": int(stats.get("subscriberCount", 0)),
+            "video_count": int(stats.get("videoCount", 0)),
+            # ISO 8601 UTC timestamp of extraction
+            "processed_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        response = self._request_channels(params)
-        payload = response.json()
-        items = payload.get("items", [])
 
-        extracted_at = datetime.now(timezone.utc).isoformat()
-        records: list[ChannelData] = []
+# ===========================================================================
+# KafkaPublisher — publishes JSON records to a Kafka topic
+# ===========================================================================
+class KafkaPublisher:
+    """
+    Publishes channel stat records to a Kafka topic.
 
-        for item in items:
-            snippet = item.get("snippet", {})
-            statistics = item.get("statistics", {})
-            channel_id = item.get("id", "")
+    Key design decisions:
+    - channel_id used as the Kafka message key → ensures ordered delivery
+      per channel and consistent partition assignment.
+    - acks='all' ensures at-least-once delivery semantics.
+    - Serialisation: JSON encoded as UTF-8 bytes.
+    """
 
-            if not channel_id:
-                logger.warning("Skipping malformed API item without channel ID")
-                continue
+    def __init__(self, bootstrap_servers: str, topic: str) -> None:
+        self._topic = topic
+        self._producer = self._build_producer(bootstrap_servers)
+        logger.info(
+            "Kafka producer initialised",
+            extra={"topic": topic, "servers": bootstrap_servers},
+        )
 
-            records.append(
-                ChannelData(
-                    channel_id=channel_id,
-                    title=snippet.get("title", ""),
-                    description=snippet.get("description", ""),
-                    view_count=_parse_int(statistics.get("viewCount")),
-                    subscriber_count=_parse_int(statistics.get("subscriberCount")),
-                    video_count=_parse_int(statistics.get("videoCount")),
-                    extracted_at=extracted_at,
+    @staticmethod
+    def _build_producer(servers: str) -> KafkaProducer:
+        """Build and return a KafkaProducer with retry on connection failure."""
+        max_attempts = 10
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return KafkaProducer(
+                    bootstrap_servers=servers,
+                    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                    key_serializer=lambda k: k.encode("utf-8") if k else None,
+                    acks="all",
+                    retries=3,
+                    compression_type="gzip",
+                    batch_size=16384,
+                    linger_ms=10,
                 )
-            )
+            except KafkaError as exc:
+                logger.warning(
+                    "Kafka not ready, retrying…",
+                    extra={"attempt": attempt, "error": str(exc)},
+                )
+                time.sleep(5)
+        logger.error("Could not connect to Kafka after max attempts")
+        raise RuntimeError("Kafka connection failed")
 
-        return records
+    def publish(self, records: List[Dict[str, Any]]) -> int:
+        """
+        Publish a list of records to Kafka.
 
-    def _request_channels(self, params: dict[str, str]) -> requests.Response:
-        self.request_count += 1
-        self.estimated_quota_units += 1  # channels.list costs 1 quota unit per call
+        Args:
+            records: List of normalised channel stat dicts.
 
-        try:
-            response = self.session.get(
-                YOUTUBE_CHANNELS_URL,
-                params=params,
-                timeout=self.timeout_seconds,
-            )
-        except requests.RequestException as exc:
-            logger.exception("Network error while calling YouTube Data API")
-            raise YouTubeAPIError("Failed to reach YouTube Data API") from exc
+        Returns:
+            Number of successfully published records.
+        """
+        published = 0
+        for record in records:
+            try:
+                future = self._producer.send(
+                    topic=self._topic,
+                    key=record.get("channel_id"),
+                    value=record,
+                )
+                future.get(timeout=10)  # Block to confirm delivery
+                published += 1
+                logger.info(
+                    "Record published to Kafka",
+                    extra={
+                        "channel_id": record.get("channel_id"),
+                        "channel_title": record.get("channel_title"),
+                    },
+                )
+            except KafkaError as exc:
+                logger.error(
+                    "Failed to publish record",
+                    extra={"channel_id": record.get("channel_id"), "error": str(exc)},
+                )
 
-        if response.ok:
-            return response
+        self._producer.flush()
+        return published
 
-        self._handle_api_error(response)
-        raise YouTubeAPIError("Unexpected YouTube API failure")
-
-    def _handle_api_error(self, response: requests.Response) -> None:
-        try:
-            error_payload = response.json()
-            error_info = error_payload.get("error", {})
-            message = error_info.get("message", response.text)
-            reasons = [
-                err.get("reason", "")
-                for err in error_info.get("errors", [])
-                if isinstance(err, dict)
-            ]
-        except ValueError:
-            message = response.text
-            reasons = []
-
-        logger.error(
-            "YouTube API error (%s): %s | reasons=%s",
-            response.status_code,
-            message,
-            reasons,
-        )
-
-        if response.status_code == 403 and (
-            "quotaExceeded" in reasons or "dailyLimitExceeded" in reasons
-        ):
-            raise QuotaExceededError(
-                "YouTube API quota exceeded. Reduce request volume or retry after quota reset."
-            )
-
-        if response.status_code == 429 or "rateLimitExceeded" in reasons:
-            raise RateLimitError(
-                "YouTube API rate limit exceeded. Increase request delay or retry later."
-            )
-
-        raise YouTubeAPIError(
-            f"YouTube API request failed with status {response.status_code}: {message}"
-        )
+    def close(self) -> None:
+        """Gracefully close the Kafka producer."""
+        self._producer.close()
+        logger.info("Kafka producer closed")
 
 
-class PostgreSQLWriter:
-    """Persists extracted channel records to PostgreSQL."""
-
-    CREATE_TABLE_SQL = """
-        CREATE TABLE IF NOT EXISTS youtube_channels (
-            channel_id VARCHAR(64) PRIMARY KEY,
-            title TEXT NOT NULL,
-            description TEXT,
-            view_count BIGINT,
-            subscriber_count BIGINT,
-            video_count BIGINT,
-            extracted_at TIMESTAMPTZ NOT NULL
-        );
+# ===========================================================================
+# PostgresWriter — direct upsert to the channel_stats table
+# ===========================================================================
+class PostgresWriter:
+    """
+    Writes channel stats directly to PostgreSQL using an UPSERT pattern
+    to ensure idempotency — safe to run multiple times for the same channels.
     """
 
     UPSERT_SQL = """
-        INSERT INTO youtube_channels (
+        INSERT INTO channel_stats (
             channel_id,
-            title,
-            description,
-            view_count,
+            channel_title,
+            channel_description,
+            published_at,
+            country,
+            total_views,
             subscriber_count,
             video_count,
-            extracted_at
+            processed_at
         )
         VALUES (
             %(channel_id)s,
-            %(title)s,
-            %(description)s,
-            %(view_count)s,
+            %(channel_title)s,
+            %(channel_description)s,
+            %(published_at)s,
+            %(country)s,
+            %(total_views)s,
             %(subscriber_count)s,
             %(video_count)s,
-            %(extracted_at)s
+            %(processed_at)s
         )
-        ON CONFLICT (channel_id) DO UPDATE SET
-            title = EXCLUDED.title,
-            description = EXCLUDED.description,
-            view_count = EXCLUDED.view_count,
-            subscriber_count = EXCLUDED.subscriber_count,
-            video_count = EXCLUDED.video_count,
-            extracted_at = EXCLUDED.extracted_at;
+        ON CONFLICT (channel_id)
+        DO UPDATE SET
+            channel_title       = EXCLUDED.channel_title,
+            channel_description = EXCLUDED.channel_description,
+            total_views         = EXCLUDED.total_views,
+            subscriber_count    = EXCLUDED.subscriber_count,
+            video_count         = EXCLUDED.video_count,
+            processed_at        = EXCLUDED.processed_at;
+    """
+
+    CREATE_TABLE_SQL = """
+        CREATE TABLE IF NOT EXISTS channel_stats (
+            channel_id          VARCHAR(64)     PRIMARY KEY,
+            channel_title       VARCHAR(255)    NOT NULL,
+            channel_description TEXT,
+            published_at        TIMESTAMPTZ,
+            country             VARCHAR(10),
+            total_views         BIGINT          DEFAULT 0,
+            subscriber_count    BIGINT          DEFAULT 0,
+            video_count         INTEGER         DEFAULT 0,
+            processed_at        TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+            created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+        );
+
+        -- Index on subscriber_count for sorted queries
+        CREATE INDEX IF NOT EXISTS idx_channel_stats_subscribers
+            ON channel_stats (subscriber_count DESC);
+
+        -- Index on processed_at for time-series queries
+        CREATE INDEX IF NOT EXISTS idx_channel_stats_processed
+            ON channel_stats (processed_at DESC);
+    """
+
+    def __init__(self, host: str, port: int, db: str, user: str, password: str) -> None:
+        self._conn_params = {
+            "host": host,
+            "port": port,
+            "dbname": db,
+            "user": user,
+            "password": password,
+            "connect_timeout": 10,
+        }
+
+    def _get_connection(self) -> psycopg2.extensions.connection:
+        return psycopg2.connect(**self._conn_params)
+
+    def ensure_table(self) -> None:
+        """Create the channel_stats table and indexes if they do not exist."""
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(self.CREATE_TABLE_SQL)
+            conn.commit()
+        logger.info("channel_stats table verified / created")
+
+    def upsert(self, records: List[Dict[str, Any]]) -> int:
+        """
+        Upsert a list of channel stat records.
+
+        Args:
+            records: List of normalised channel stat dicts.
+
+        Returns:
+            Number of rows affected.
+        """
+        if not records:
+            return 0
+
+        affected = 0
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                for record in records:
+                    cur.execute(self.UPSERT_SQL, record)
+                    affected += cur.rowcount
+            conn.commit()
+
+        logger.info("Upsert complete", extra={"rows_affected": affected})
+        return affected
+
+
+# ===========================================================================
+# Orchestrator — ties together API, Kafka/Postgres, and batching logic
+# ===========================================================================
+class YouTubeExtractorOrchestrator:
+    """
+    Main orchestrator:
+    - Batches channel IDs to respect API limits.
+    - Applies a small delay between batches for quota management.
+    - Routes output to Kafka (streaming) or PostgreSQL (batch).
     """
 
     def __init__(
         self,
-        host: str,
-        port: int,
-        database: str,
-        user: str,
-        password: str,
+        config: Config,
+        mode: str = "kafka",
     ) -> None:
-        self.connection_kwargs = {
-            "host": host,
-            "port": port,
-            "dbname": database,
-            "user": user,
-            "password": password,
-        }
+        self._config = config
+        self._mode = mode
+        self._api_client = YouTubeAPIClient(config.api_key)
 
-    def save_channels(self, channels: Sequence[ChannelData]) -> int:
-        if not channels:
-            logger.info("No channel records to persist")
-            return 0
-
-        rows = [asdict(channel) for channel in channels]
-
-        try:
-            with psycopg2.connect(**self.connection_kwargs) as connection:
-                with connection.cursor() as cursor:
-                    cursor.execute(self.CREATE_TABLE_SQL)
-                    psycopg2.extras.execute_batch(cursor, self.UPSERT_SQL, rows)
-                connection.commit()
-        except psycopg2.Error as exc:
-            logger.exception("Failed to persist channel data to PostgreSQL")
-            raise YouTubeExtractorError("PostgreSQL write failed") from exc
-
-        logger.info("Persisted %d channel record(s) to PostgreSQL", len(rows))
-        return len(rows)
-
-
-def _normalize_channel_ids(channel_ids: Sequence[str]) -> list[str]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-
-    for channel_id in channel_ids:
-        cleaned = channel_id.strip()
-        if not cleaned or cleaned in seen:
-            continue
-        normalized.append(cleaned)
-        seen.add(cleaned)
-
-    return normalized
-
-
-def _parse_channel_ids_from_env() -> list[str]:
-    channel_ids: list[str] = []
-
-    env_ids = os.getenv("YOUTUBE_CHANNEL_IDS", "")
-    if env_ids:
-        channel_ids.extend(env_ids.split(","))
-
-    single_id = os.getenv("YOUTUBE_CHANNEL_ID", "").strip()
-    if single_id and single_id != "your_channel_id_here":
-        channel_ids.append(single_id)
-
-    return _normalize_channel_ids(channel_ids)
-
-
-def extract_channels(
-    channel_ids: Sequence[str],
-    *,
-    api_key: str | None = None,
-    request_delay_seconds: float | None = None,
-) -> list[dict[str, Any]]:
-    """
-    Programmatic entry point for other pipeline components.
-
-    Returns a list of dictionaries suitable for JSON serialization or downstream ETL.
-    """
-    resolved_api_key = api_key or os.getenv("YOUTUBE_API_KEY", "")
-    delay = request_delay_seconds
-    if delay is None:
-        delay = float(os.getenv("YOUTUBE_REQUEST_DELAY", DEFAULT_REQUEST_DELAY_SECONDS))
-
-    extractor = YouTubeExtractor(resolved_api_key, request_delay_seconds=delay)
-    records = extractor.fetch_channels(channel_ids)
-    return [asdict(record) for record in records]
-
-
-def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Extract YouTube channel metadata using the YouTube Data API v3."
-    )
-    parser.add_argument(
-        "--channel-id",
-        action="append",
-        dest="channel_ids",
-        default=[],
-        help="YouTube channel ID. Can be passed multiple times.",
-    )
-    parser.add_argument(
-        "--channel-ids",
-        help="Comma-separated list of YouTube channel IDs.",
-    )
-    parser.add_argument(
-        "--output",
-        choices=("stdout", "json", "postgres"),
-        default=os.getenv("EXTRACTOR_OUTPUT", "stdout"),
-        help="Output destination for extracted records.",
-    )
-    parser.add_argument(
-        "--output-file",
-        default=os.getenv("EXTRACTOR_OUTPUT_FILE", "youtube_channels.json"),
-        help="File path used when --output json is selected.",
-    )
-    parser.add_argument(
-        "--request-delay",
-        type=float,
-        default=float(
-            os.getenv("YOUTUBE_REQUEST_DELAY", DEFAULT_REQUEST_DELAY_SECONDS)
-        ),
-        help="Delay in seconds between batched API requests.",
-    )
-    parser.add_argument(
-        "--log-level",
-        default=os.getenv("LOG_LEVEL", "INFO"),
-        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
-        help="Logging verbosity.",
-    )
-    return parser
-
-
-def _configure_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = _build_arg_parser()
-    args = parser.parse_args(argv)
-    _configure_logging(args.log_level)
-
-    channel_ids = list(args.channel_ids)
-    if args.channel_ids_csv := args.channel_ids:
-        channel_ids.extend(args.channel_ids_csv.split(","))
-    channel_ids.extend(_parse_channel_ids_from_env())
-    channel_ids = _normalize_channel_ids(channel_ids)
-
-    if not channel_ids:
-        logger.error(
-            "No channel IDs provided. Use --channel-id, --channel-ids, or YOUTUBE_CHANNEL_ID."
-        )
-        return 1
-
-    try:
-        extractor = YouTubeExtractor(
-            os.getenv("YOUTUBE_API_KEY", ""),
-            request_delay_seconds=args.request_delay,
-        )
-        records = extractor.fetch_channels(channel_ids)
-        payload = [asdict(record) for record in records]
-
-        if args.output == "stdout":
-            print(json.dumps(payload, indent=2))
-        elif args.output == "json":
-            with open(args.output_file, "w", encoding="utf-8") as output_file:
-                json.dump(payload, output_file, indent=2)
-            logger.info("Wrote %d record(s) to %s", len(payload), args.output_file)
-        elif args.output == "postgres":
-            writer = PostgreSQLWriter(
-                host=os.getenv("POSTGRES_HOST", "postgres"),
-                port=int(os.getenv("POSTGRES_PORT", "5432")),
-                database=os.getenv("POSTGRES_DB", "youtube_data"),
-                user=os.getenv("POSTGRES_USER", "airflow"),
-                password=os.getenv("POSTGRES_PASSWORD", ""),
+        if mode == "kafka":
+            self._publisher: Optional[KafkaPublisher] = KafkaPublisher(
+                config.kafka_servers, config.kafka_topic
             )
-            writer.save_channels(records)
+            self._db_writer: Optional[PostgresWriter] = None
+        else:
+            self._publisher = None
+            self._db_writer = PostgresWriter(
+                config.pg_host,
+                config.pg_port,
+                config.pg_db,
+                config.pg_user,
+                config.pg_password,
+            )
+            self._db_writer.ensure_table()
 
-        return 0
+    def run(self) -> None:
+        """
+        Entry-point: iterate over channel ID batches, extract stats,
+        and dispatch to the configured output.
+        """
+        channel_ids = self._config.channel_ids
+        batch_size = self._config.api_batch_size
+        total_processed = 0
 
-    except QuotaExceededError as exc:
-        logger.error("Quota exceeded: %s", exc)
-        return 2
-    except RateLimitError as exc:
-        logger.error("Rate limit exceeded: %s", exc)
-        return 3
-    except (YouTubeExtractorError, ValueError) as exc:
-        logger.error("Extraction failed: %s", exc)
-        return 1
-    except KeyboardInterrupt:
-        logger.warning("Extraction interrupted by user")
-        return 130
+        logger.info(
+            "Extraction started",
+            extra={"total_channels": len(channel_ids), "mode": self._mode},
+        )
+
+        # Split channel_ids into batches of `batch_size`
+        for batch_start in range(0, len(channel_ids), batch_size):
+            batch = channel_ids[batch_start : batch_start + batch_size]
+
+            try:
+                records = self._api_client.fetch_channel_statistics(batch)
+            except HttpError as exc:
+                logger.error(
+                    "Batch fetch failed — skipping batch",
+                    extra={"batch": batch, "error": str(exc)},
+                )
+                continue
+
+            if not records:
+                logger.warning(
+                    "No records returned for batch",
+                    extra={"batch": batch},
+                )
+                continue
+
+            if self._mode == "kafka" and self._publisher:
+                count = self._publisher.publish(records)
+            else:
+                count = self._db_writer.upsert(records)  # type: ignore[union-attr]
+
+            total_processed += count
+
+            # Polite delay between batches to stay within quota budget
+            time.sleep(self._config.quota_delay_seconds)
+
+        logger.info(
+            "Extraction complete",
+            extra={"total_processed": total_processed, "mode": self._mode},
+        )
+
+        # Clean up resources
+        if self._publisher:
+            self._publisher.close()
+
+
+# ===========================================================================
+# CLI Entry Point
+# ===========================================================================
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="YouTube Channel Statistics Extractor",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["kafka", "postgres"],
+        default=os.getenv("EXTRACTOR_MODE", "kafka"),
+        help=(
+            "Output mode: 'kafka' publishes to a Kafka topic (default), "
+            "'postgres' upserts directly into PostgreSQL."
+        ),
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    config = Config()
+
+    logger.info(
+        "YouTube Extractor starting",
+        extra={
+            "mode": args.mode,
+            "channel_count": len(config.channel_ids),
+        },
+    )
+
+    orchestrator = YouTubeExtractorOrchestrator(config=config, mode=args.mode)
+    orchestrator.run()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
