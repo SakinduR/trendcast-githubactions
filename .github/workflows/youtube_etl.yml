@@ -1,0 +1,74 @@
+name: YouTube ETL Pipeline
+
+on:
+  schedule:
+    # Job 1 — Channel Ingestion: every 12 hours
+    - cron: '0 */12 * * *'
+    # Job 2 — Timeseries Collector: every 15 minutes
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Which job to run manually'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - job1_channel_ingestion
+          - job2_timeseries_collector
+
+env:
+  SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+  YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+
+jobs:
+  # =========================================================================
+  # Job 1 — Channel Ingestion (runs every 12 hours)
+  # =========================================================================
+  channel_ingestion:
+    name: "Job 1 — Channel Ingestion"
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'both' || github.event.inputs.job == 'job1_channel_ingestion')
+      || github.event.schedule == '0 */12 * * *'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install psycopg2-binary google-api-python-client
+
+      - name: Run Channel Ingestion
+        run: python youtube_extractor/job1_channel_ingestion.py
+
+  # =========================================================================
+  # Job 2 — Timeseries Collector (runs every 15 minutes)
+  # =========================================================================
+  timeseries_collector:
+    name: "Job 2 — Timeseries Collector"
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'both' || github.event.inputs.job == 'job2_timeseries_collector')
+      || github.event.schedule == '*/15 * * * *'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install psycopg2-binary google-api-python-client
+
+      - name: Run Timeseries Collector
+        run: python youtube_extractor/job2_timeseries_collector.py
