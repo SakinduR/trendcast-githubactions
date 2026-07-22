@@ -55,7 +55,9 @@ youtube-pipeline/
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── dags/
-│       └── youtube_pipeline.py ← DAG: create_tables >> extract_youtube_data
+│       ├── youtube_pipeline.py ← Legacy trends DAG
+│       ├── job1_channel_ingestion.py ← Loads active channels and seeds `videos`
+│       └── job2_timeseries_collector.py ← Polls due videos and writes `view_timeseries`
 │
 ├── spark/
 │   ├── Dockerfile
@@ -70,7 +72,8 @@ youtube-pipeline/
 ├── youtube_extractor/
 │   ├── Dockerfile
 │   ├── requirements.txt
-│   └── extractor.py           ← YouTube API → Kafka / PostgreSQL
+│   ├── extractor.py           ← YouTube API → Kafka / PostgreSQL
+│   └── data_loader.py         ← Pandas / TensorFlow bridge for forecasting
 │
 └── postgres/
     └── init/
@@ -90,8 +93,8 @@ youtube-pipeline/
 ### Step 1 — Configure Environment
 
 ```bash
-# Copy the template (already provided) and fill in your values
-cp .env .env.local   # optional, or edit .env directly
+# Copy the local template and fill in your values
+cp .env.local .env   # optional, or edit .env directly
 
 # Required values to fill in:
 # YOUTUBE_API_KEY=<your_api_key>
@@ -113,13 +116,13 @@ docker compose up --build -d
 docker compose ps
 ```
 
-| Service | URL | Credentials |
-|---|---|---|
-| Airflow Webserver | http://localhost:8080 | admin / admin |
-| Jupyter Lab | http://localhost:8888 | token from `.env` |
-| Spark Master UI | http://localhost:8081 | — |
-| PostgreSQL | localhost:5433 | from `.env` |
-| Kafka | localhost:29092 | — |
+| Service           | URL                   | Credentials       |
+| ----------------- | --------------------- | ----------------- |
+| Airflow Webserver | http://localhost:8084 | admin / admin     |
+| Jupyter Lab       | http://localhost:8888 | token from `.env` |
+| Spark Master UI   | http://localhost:8081 | —                 |
+| PostgreSQL        | localhost:5433        | from `.env`       |
+| Kafka             | localhost:29092       | —                 |
 
 ### Step 4 — Configure Airflow PostgreSQL Connection
 
@@ -134,11 +137,29 @@ docker compose ps
    - **Password**: `airflow_secret_password` (or your `.env` value)
    - **Port**: `5432`
 
+### Step 4.5 — Load Channel Seed Data
+
+Before triggering the new DAGs, load your channel CSV into `channel_stats` so `job1_channel_ingestion` can read `uploads_playlist_id` values.
+
+From a local psql session on Windows, use `\copy` with your Downloads path:
+
+```sql
+\copy channel_stats(channel_id, channel_title, country, subscriber_count, total_views, uploads_playlist_id)
+FROM 'C:/Users/ASUS/Downloads/output_channels (1).csv'
+WITH (FORMAT csv, HEADER true);
+```
+
+If the file contains encoding issues, set the client encoding first:
+
+```sql
+\encoding UTF8
+```
+
 ### Step 5 — Trigger the DAG
 
-1. Enable the `youtube_data_pipeline` DAG in the Airflow UI
-2. Click **Trigger DAG** to run immediately
-3. Watch the tasks: `create_tables` → `extract_youtube_data`
+1. Enable and trigger `job1_channel_ingestion` in the Airflow UI.
+2. After it completes, enable and trigger `job2_timeseries_collector`.
+3. Watch the first DAG seed `videos`, then the second DAG poll due videos and write `view_timeseries`.
 
 ### Step 6 — Explore Data in Jupyter
 
@@ -193,7 +214,35 @@ CREATE TABLE channel_stats (
     subscriber_count    BIGINT        DEFAULT 0,     -- Current subscribers
     video_count         INTEGER       DEFAULT 0,
     processed_at        TIMESTAMPTZ   NOT NULL,      -- Last extraction time
-    created_at          TIMESTAMPTZ   NOT NULL
+    created_at          TIMESTAMPTZ   NOT NULL,
+    title               VARCHAR(255),
+    tier_category       VARCHAR(64),
+    uploads_playlist_id VARCHAR(64),
+    last_checked_at     TIMESTAMPTZ
+);
+```
+
+Additional runtime tables used by the new Airflow pipeline:
+
+```sql
+CREATE TABLE videos (
+    video_id               VARCHAR(64) PRIMARY KEY,
+    channel_id             VARCHAR(64) NOT NULL,
+    published_at           TIMESTAMPTZ NOT NULL,
+    status                 VARCHAR(16) NOT NULL DEFAULT 'active',
+    last_polled_at         TIMESTAMPTZ,
+    next_poll_at           TIMESTAMPTZ,
+    current_interval_hours  INTEGER NOT NULL DEFAULT 6,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE view_timeseries (
+    id            BIGSERIAL PRIMARY KEY,
+    video_id      VARCHAR(64) NOT NULL,
+    scraped_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    view_count    BIGINT NOT NULL DEFAULT 0,
+    like_count    BIGINT NOT NULL DEFAULT 0,
+    comment_count BIGINT NOT NULL DEFAULT 0
 );
 ```
 
@@ -209,15 +258,16 @@ SELECT * FROM channel_stats_enriched;
 ## Airflow DAG — Task Graph
 
 ```
-create_tables
+job1_channel_ingestion
      │
      ▼
-extract_youtube_data
+job2_timeseries_collector
 ```
 
-- **Schedule**: `0 */6 * * *` (every 6 hours)
-- **Retries**: 3 × with exponential backoff (5m → 10m → 20m)
-- **Idempotency**: `INSERT ... ON CONFLICT DO UPDATE` ensures safe reruns
+- **Job 1 schedule**: `0 */12 * * *` (every 12 hours)
+- **Job 2 schedule**: `*/15 * * * *` (every 15 minutes)
+- **Job 1 purpose**: read active channel seeds and upsert new entries into `videos`
+- **Job 2 purpose**: poll due videos, insert raw metrics into `view_timeseries`, and update polling cadence
 
 ---
 

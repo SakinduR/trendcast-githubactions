@@ -148,3 +148,91 @@ FROM channel_stats cs;
 
 COMMENT ON VIEW channel_stats_enriched IS
     'Derived view exposing pre-computed engagement KPIs on top of channel_stats. Use in Jupyter notebooks and BI dashboards.';
+
+-- =============================================================================
+-- INCREMENTAL SCHEMA EXTENSION FOR CHANNEL SEED LIST
+-- Adds only the new fields needed by the seed-list workflow to the existing
+-- channel_stats table used by the current pipeline.
+-- =============================================================================
+ALTER TABLE channel_stats
+    ADD COLUMN IF NOT EXISTS title VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS tier_category VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS uploads_playlist_id VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ;
+
+-- Backfill title from existing channel_title for existing rows.
+UPDATE channel_stats
+SET title = channel_title
+WHERE title IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_channel_stats_last_checked
+    ON channel_stats (last_checked_at DESC);
+
+-- =============================================================================
+-- TABLE: videos
+-- Queue and status management for polling cadence per video.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS videos (
+    video_id                 VARCHAR(64)     PRIMARY KEY,
+    channel_id               VARCHAR(64)     NOT NULL,
+    published_at             TIMESTAMPTZ     NOT NULL,
+    status                   VARCHAR(16)     NOT NULL DEFAULT 'active',
+    last_polled_at           TIMESTAMPTZ,
+    next_poll_at             TIMESTAMPTZ,
+    current_interval_hours   INTEGER         NOT NULL DEFAULT 6,
+    created_at               TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT fk_videos_channel
+        FOREIGN KEY (channel_id)
+        REFERENCES channel_stats (channel_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT chk_videos_status
+        CHECK (status IN ('active', 'archived', 'deleted')),
+
+    CONSTRAINT chk_videos_current_interval_hours
+        CHECK (current_interval_hours > 0)
+);
+
+-- Fast queue picks and common filter patterns.
+CREATE INDEX IF NOT EXISTS idx_videos_next_poll_at
+    ON videos (next_poll_at);
+
+CREATE INDEX IF NOT EXISTS idx_videos_status_next_poll
+    ON videos (status, next_poll_at);
+
+CREATE INDEX IF NOT EXISTS idx_videos_channel_id
+    ON videos (channel_id);
+
+-- =============================================================================
+-- TABLE: view_timeseries
+-- Raw metric snapshots captured at each polling time.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS view_timeseries (
+    id                      BIGSERIAL       PRIMARY KEY,
+    video_id                VARCHAR(64)     NOT NULL,
+    scraped_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    view_count              BIGINT          NOT NULL DEFAULT 0,
+    like_count              BIGINT          NOT NULL DEFAULT 0,
+    comment_count           BIGINT          NOT NULL DEFAULT 0,
+
+    CONSTRAINT fk_view_timeseries_video
+        FOREIGN KEY (video_id)
+        REFERENCES videos (video_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT chk_view_timeseries_view_count
+        CHECK (view_count >= 0),
+
+    CONSTRAINT chk_view_timeseries_like_count
+        CHECK (like_count >= 0),
+
+    CONSTRAINT chk_view_timeseries_comment_count
+        CHECK (comment_count >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_view_timeseries_video_scraped
+    ON view_timeseries (video_id, scraped_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_view_timeseries_scraped_at
+    ON view_timeseries (scraped_at DESC);
