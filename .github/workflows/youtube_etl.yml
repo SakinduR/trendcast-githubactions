@@ -46,7 +46,7 @@ jobs:
         run: pip install psycopg2-binary google-api-python-client
 
       - name: Run Channel Ingestion
-        run: python youtube_extractor/job1_channel_ingestion.py
+        run: python youtube-etl-pipeline/youtube_extractor/job1_channel_ingestion.py
 
   # =========================================================================
   # Job 2 — Timeseries Collector (runs every 15 minutes)
@@ -71,4 +71,4 @@ jobs:
         run: pip install psycopg2-binary google-api-python-client
 
       - name: Run Timeseries Collector
-        run: python youtube_extractor/job2_timeseries_collector.py
+        run: python youtube-etl-pipeline/youtube_extractor/job2_timeseries_collector.py
