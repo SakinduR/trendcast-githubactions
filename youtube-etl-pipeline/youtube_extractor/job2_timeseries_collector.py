@@ -128,6 +128,9 @@ def fetch_youtube_stats(due_videos: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return metrics
 
 
+from psycopg2.extras import execute_batch
+
+
 # ---------------------------------------------------------------------------
 # Step 3: Persist metrics and apply decay-polling updates
 # ---------------------------------------------------------------------------
@@ -142,50 +145,45 @@ def apply_decay_and_update(conn, metrics: List[Dict[str, Any]]) -> int:
     metrics.sort(key=lambda x: x["video_id"])
 
     now = datetime.now(timezone.utc)
-    written_rows = 0
+    ts_rows: List[Dict[str, Any]] = []
+    poll_rows: List[Dict[str, Any]] = []
+
+    for metric in metrics:
+        # Parse published_at
+        published_at_raw = metric["published_at"]
+        if isinstance(published_at_raw, str):
+            published_at = datetime.fromisoformat(
+                published_at_raw.replace("Z", "+00:00")
+            )
+        else:
+            published_at = published_at_raw
+
+        age_hours = (now - published_at).total_seconds() / 3600.0
+        current_interval_hours = select_interval_hours(age_hours)
+        next_poll_at = now + timedelta(hours=current_interval_hours)
+
+        ts_rows.append({
+            "video_id": metric["video_id"],
+            "scraped_at": metric["scraped_at"],
+            "view_count": metric["view_count"],
+            "like_count": metric["like_count"],
+            "comment_count": metric["comment_count"],
+        })
+
+        poll_rows.append({
+            "video_id": metric["video_id"],
+            "last_polled_at": now.isoformat(),
+            "next_poll_at": next_poll_at.isoformat(),
+            "current_interval_hours": current_interval_hours,
+        })
 
     with conn.cursor() as cur:
-        for metric in metrics:
-            # Parse published_at
-            published_at_raw = metric["published_at"]
-            if isinstance(published_at_raw, str):
-                published_at = datetime.fromisoformat(
-                    published_at_raw.replace("Z", "+00:00")
-                )
-            else:
-                published_at = published_at_raw
-
-            age_hours = (now - published_at).total_seconds() / 3600.0
-            current_interval_hours = select_interval_hours(age_hours)
-            next_poll_at = now + timedelta(hours=current_interval_hours)
-
-            # Insert timeseries row
-            cur.execute(
-                INSERT_TIMESERIES_SQL,
-                {
-                    "video_id": metric["video_id"],
-                    "scraped_at": metric["scraped_at"],
-                    "view_count": metric["view_count"],
-                    "like_count": metric["like_count"],
-                    "comment_count": metric["comment_count"],
-                },
-            )
-
-            # Update polling cadence
-            cur.execute(
-                UPDATE_VIDEO_POLLS_SQL,
-                {
-                    "video_id": metric["video_id"],
-                    "last_polled_at": now.isoformat(),
-                    "next_poll_at": next_poll_at.isoformat(),
-                    "current_interval_hours": current_interval_hours,
-                },
-            )
-            written_rows += 1
+        execute_batch(cur, INSERT_TIMESERIES_SQL, ts_rows, page_size=200)
+        execute_batch(cur, UPDATE_VIDEO_POLLS_SQL, poll_rows, page_size=200)
 
     conn.commit()
-    log.info("Persisted %d time-series rows and updated polling cadence", written_rows)
-    return written_rows
+    log.info("Persisted %d time-series rows and updated polling cadence", len(metrics))
+    return len(metrics)
 
 
 # ---------------------------------------------------------------------------

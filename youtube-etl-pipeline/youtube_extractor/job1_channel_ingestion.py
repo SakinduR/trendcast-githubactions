@@ -120,6 +120,9 @@ def fetch_latest_uploads(channel_info: Dict[str, str]) -> List[Dict[str, Any]]:
     return dummy_videos
 
 
+from psycopg2.extras import execute_batch
+
+
 # ---------------------------------------------------------------------------
 # Step 3: Upsert all videos into the polling queue
 # ---------------------------------------------------------------------------
@@ -133,15 +136,12 @@ def merge_new_videos_to_db(conn, videos: List[Dict[str, Any]]) -> int:
     # Sort deterministically by video_id to prevent PostgreSQL deadlocks with Job 2
     videos.sort(key=lambda x: x["video_id"])
 
-    affected_rows = 0
     with conn.cursor() as cur:
-        for video in videos:
-            cur.execute(UPSERT_VIDEOS_SQL, video)
-            affected_rows += 1
+        execute_batch(cur, UPSERT_VIDEOS_SQL, videos, page_size=200)
     conn.commit()
 
-    log.info("Upserted %d video rows", affected_rows)
-    return affected_rows
+    log.info("Upserted %d video rows", len(videos))
+    return len(videos)
 
 
 # ---------------------------------------------------------------------------

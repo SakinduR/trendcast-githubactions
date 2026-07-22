@@ -54,9 +54,12 @@ jobs:
   timeseries_collector:
     name: "Job 2 — Timeseries Collector"
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'both' || github.event.inputs.job == 'job2_timeseries_collector')
-      || github.event.schedule == '*/15 * * * *'
+    needs: channel_ingestion
+    if: |
+      always() && (
+        (github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'both' || github.event.inputs.job == 'job2_timeseries_collector'))
+        || github.event.schedule == '*/15 * * * *'
+      )
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
