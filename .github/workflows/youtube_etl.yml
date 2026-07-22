@@ -2,10 +2,10 @@ name: YouTube ETL Pipeline
 
 on:
   schedule:
-    # Job 1 — Channel Ingestion: every 12 hours
-    - cron: '0 */12 * * *'
-    # Job 2 — Timeseries Collector: every 15 minutes
-    - cron: '*/15 * * * *'
+    # Job 1 — Channel Ingestion: twice daily at minute 17 (avoiding top of the hour queue spikes)
+    - cron: '17 */12 * * *'
+    # Job 2 — Timeseries Collector: every 15 minutes at minutes 7, 22, 37, 52
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       job:
@@ -24,14 +24,14 @@ env:
 
 jobs:
   # =========================================================================
-  # Job 1 — Channel Ingestion (runs every 12 hours)
+  # Job 1 — Channel Ingestion (runs twice daily)
   # =========================================================================
   channel_ingestion:
     name: "Job 1 — Channel Ingestion"
     runs-on: ubuntu-latest
     if: >-
       (github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'both' || github.event.inputs.job == 'job1_channel_ingestion'))
-      || (github.event_name == 'schedule' && github.event.schedule == '0 */12 * * *')
+      || (github.event_name == 'schedule' && github.event.schedule == '17 */12 * * *')
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -56,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       (github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'both' || github.event.inputs.job == 'job2_timeseries_collector'))
-      || (github.event_name == 'schedule' && github.event.schedule == '*/15 * * * *')
+      || (github.event_name == 'schedule' && github.event.schedule == '7,22,37,52 * * * *')
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
