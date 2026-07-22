@@ -130,6 +130,9 @@ def merge_new_videos_to_db(conn, videos: List[Dict[str, Any]]) -> int:
         log.info("No videos to upsert")
         return 0
 
+    # Sort deterministically by video_id to prevent PostgreSQL deadlocks with Job 2
+    videos.sort(key=lambda x: x["video_id"])
+
     affected_rows = 0
     with conn.cursor() as cur:
         for video in videos:

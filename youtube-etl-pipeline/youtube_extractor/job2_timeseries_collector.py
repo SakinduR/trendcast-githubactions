@@ -138,6 +138,9 @@ def apply_decay_and_update(conn, metrics: List[Dict[str, Any]]) -> int:
         log.info("No metrics to persist")
         return 0
 
+    # Sort deterministically by video_id to prevent PostgreSQL deadlocks with Job 1
+    metrics.sort(key=lambda x: x["video_id"])
+
     now = datetime.now(timezone.utc)
     written_rows = 0
 
