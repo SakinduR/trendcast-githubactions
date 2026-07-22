@@ -96,15 +96,17 @@ def get_active_channels(conn) -> List[Dict[str, str]]:
 def fetch_latest_uploads(channel_info: Dict[str, str]) -> List[Dict[str, Any]]:
     """Simulate the playlistItems.list response for the five latest uploads."""
 
-    channel_id = channel_info["channel_id"]
-    playlist_id = channel_info["uploads_playlist_id"]
+    channel_id = str(channel_info["channel_id"]).strip()[:64]
+    raw_playlist = str(channel_info["uploads_playlist_id"]).strip()
+    playlist_id = raw_playlist.split("=")[-1] if "=" in raw_playlist else raw_playlist
     base_published_at = datetime.now(timezone.utc)
 
     dummy_videos: List[Dict[str, Any]] = []
     for index in range(5):
+        vid = f"{playlist_id}_v{index + 1}"[:64]
         dummy_videos.append(
             {
-                "video_id": f"{playlist_id}_video_{index + 1}",
+                "video_id": vid,
                 "channel_id": channel_id,
                 "published_at": (base_published_at - timedelta(hours=index)).isoformat(),
             }
