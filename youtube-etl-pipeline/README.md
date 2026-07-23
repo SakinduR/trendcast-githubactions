@@ -181,6 +181,18 @@ docker compose run --rm youtube-extractor python extractor.py --mode=kafka
 docker compose run --rm youtube-extractor python extractor.py --mode=postgres
 ```
 
+### Triggering GitHub Actions via API
+
+To run the Timeseries Collector on GitHub Actions instantly without the scheduler delays, use the helper script:
+
+```bash
+python youtube_extractor/trigger_collector.py
+```
+
+Before running, make sure to add the following variables to your local `.env` file:
+* `GITHUB_PAT`: A GitHub Personal Access Token (PAT) with `repo` scope.
+* `GITHUB_REPO`: Your repository path (e.g., `username/repository`). Defaults to `SakinduR/trendcast-githubactions`.
+
 ### Spark Processing (`spark/`)
 
 Submit the PySpark job:
