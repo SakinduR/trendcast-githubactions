@@ -18,6 +18,7 @@ on:
 
 env:
   SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+  YOUTUBE_API_KEYS: ${{ secrets.YOUTUBE_API_KEYS }}
   YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
 
 jobs:

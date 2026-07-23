@@ -97,10 +97,17 @@ youtube-pipeline/
 cp .env.local .env   # optional, or edit .env directly
 
 # Required values to fill in:
-# YOUTUBE_API_KEY=<your_api_key>
+# YOUTUBE_API_KEYS=key1,key2,key3   # Preferred: comma-separated pool of API keys
+# YOUTUBE_API_KEY=<your_api_key>    # Fallback: single API key (backward-compatible)
 # YOUTUBE_CHANNEL_IDS=UCxxxxxx,UCyyyyyy
 # AIRFLOW__CORE__FERNET_KEY=<generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())">
 ```
+
+> **API Key Pool**: Supply multiple YouTube Data API v3 keys via `YOUTUBE_API_KEYS`
+> (comma-separated). When one key's daily quota is exhausted (HTTP 403), the
+> pipeline automatically rotates to the next available key. This multiplies your
+> effective daily quota (10,000 units × number of keys). If `YOUTUBE_API_KEYS`
+> is not set, the pipeline falls back to the single `YOUTUBE_API_KEY`.
 
 ### Step 2 — Build & Start All Services
 

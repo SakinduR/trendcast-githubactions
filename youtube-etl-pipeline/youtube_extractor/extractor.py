@@ -8,7 +8,8 @@ Responsibilities:
   3. Optionally upsert records directly to PostgreSQL (batch mode).
 
 Environment Variables Required:
-  YOUTUBE_API_KEY         — YouTube Data API v3 key
+  YOUTUBE_API_KEYS        — Comma-separated YouTube Data API v3 keys (preferred)
+  YOUTUBE_API_KEY         — Single YouTube API key (backward-compatible fallback)
   YOUTUBE_CHANNEL_IDS     — Comma-separated channel IDs
   KAFKA_BOOTSTRAP_SERVERS — e.g. kafka:9092
   KAFKA_TOPIC             — Target Kafka topic name
@@ -46,6 +47,8 @@ from tenacity import (
     wait_exponential,
 )
 
+from youtube_extractor.key_pool import APIKeyPool, AllKeysExhaustedError
+
 # ---------------------------------------------------------------------------
 # Load environment variables from .env (only for local dev; Docker sets them)
 # ---------------------------------------------------------------------------
@@ -73,7 +76,11 @@ class Config:
     """Centralises all configuration and validates required values on startup."""
 
     def __init__(self) -> None:
-        self.api_key: str = self._require("YOUTUBE_API_KEY")
+        # API key pool — supports multiple keys via YOUTUBE_API_KEYS or
+        # a single key via YOUTUBE_API_KEY (backward-compatible fallback)
+        self.key_pool: APIKeyPool = APIKeyPool.from_env()
+        # Keep api_key for backward compatibility with any code that reads it
+        self.api_key: str = self.key_pool.active_key
         self.channel_ids: List[str] = [
             cid.strip()
             for cid in self._require("YOUTUBE_CHANNEL_IDS").split(",")
@@ -93,7 +100,7 @@ class Config:
         # YouTube API max channel IDs per request
         self.api_batch_size: int = 50
         # Quota cost per channels.list call = 1 unit
-        # Daily quota: 10,000 units → can make 10,000 calls/day
+        # Daily quota: 10,000 units per key → pool multiplies effective quota
         self.quota_delay_seconds: float = float(
             os.getenv("QUOTA_DELAY_SECONDS", "0.1")
         )
@@ -108,7 +115,7 @@ class Config:
 
 
 # ===========================================================================
-# YouTubeAPIClient — wraps google-api-python-client with retry logic
+# YouTubeAPIClient — wraps google-api-python-client with key-pool rotation
 # ===========================================================================
 class YouTubeAPIClient:
     """
@@ -116,19 +123,22 @@ class YouTubeAPIClient:
 
     Quota Management:
     - channels.list costs 1 quota unit.
-    - Default daily quota: 10,000 units.
+    - Default daily quota: 10,000 units per key.
+    - Multiple API keys are pooled via APIKeyPool; on quota exhaustion
+      the client automatically rotates to the next available key.
     - We batch up to 50 IDs per request to minimise quota usage.
-    - Exponential back-off on transient errors (5xx, 429).
+    - Exponential back-off on transient errors (5xx).
     """
 
     # Parts to request — avoid requesting unnecessary parts to save quota
     CHANNEL_PARTS = "snippet,statistics"
 
-    def __init__(self, api_key: str) -> None:
-        self._service = build(
-            "youtube", "v3", developerKey=api_key, cache_discovery=False
+    def __init__(self, key_pool: APIKeyPool) -> None:
+        self._key_pool = key_pool
+        logger.info(
+            "YouTube API client initialised with key pool",
+            extra={"pool_size": key_pool.pool_size},
         )
-        logger.info("YouTube API client initialised")
 
     @retry(
         retry=retry_if_exception_type(HttpError),
@@ -141,6 +151,7 @@ class YouTubeAPIClient:
     ) -> List[Dict[str, Any]]:
         """
         Fetch statistics for up to 50 channel IDs in a single API call.
+        Automatically rotates API keys on quota exhaustion (HTTP 403).
 
         Args:
             channel_ids: List of YouTube channel ID strings.
@@ -149,35 +160,37 @@ class YouTubeAPIClient:
             List of normalised channel stat dictionaries.
 
         Raises:
-            HttpError: On non-retryable API errors (e.g. 403 quota exceeded).
+            AllKeysExhaustedError: If all API keys have hit their quota.
+            HttpError: On non-retryable, non-quota API errors.
         """
         if not channel_ids:
             return []
 
         logger.info(
             "Fetching channel stats",
-            extra={"channel_count": len(channel_ids)},
+            extra={
+                "channel_count": len(channel_ids),
+                "remaining_keys": self._key_pool.remaining_keys,
+            },
         )
 
         try:
-            response = (
-                self._service.channels()
-                .list(
+            response = self._key_pool.execute_with_rotation(
+                lambda svc: svc.channels().list(
                     part=self.CHANNEL_PARTS,
                     id=",".join(channel_ids),
                     maxResults=50,
                 )
-                .execute()
             )
+        except AllKeysExhaustedError:
+            logger.error(
+                "All API keys exhausted — cannot fetch channel stats",
+                extra={"channel_ids": channel_ids},
+            )
+            raise
         except HttpError as exc:
             status_code = exc.resp.status
-            if status_code == 403:
-                logger.error(
-                    "YouTube API quota exceeded or access forbidden",
-                    extra={"status_code": status_code, "details": str(exc)},
-                )
-                raise  # Do not retry quota exhaustion — re-raise immediately
-            elif status_code in (500, 502, 503, 504):
+            if status_code in (500, 502, 503, 504):
                 logger.warning(
                     "Transient API error — will retry",
                     extra={"status_code": status_code},
@@ -439,7 +452,7 @@ class YouTubeExtractorOrchestrator:
     ) -> None:
         self._config = config
         self._mode = mode
-        self._api_client = YouTubeAPIClient(config.api_key)
+        self._api_client = YouTubeAPIClient(config.key_pool)
 
         if mode == "kafka":
             self._publisher: Optional[KafkaPublisher] = KafkaPublisher(
@@ -477,6 +490,12 @@ class YouTubeExtractorOrchestrator:
 
             try:
                 records = self._api_client.fetch_channel_statistics(batch)
+            except AllKeysExhaustedError:
+                logger.error(
+                    "All API keys exhausted — aborting remaining batches",
+                    extra={"batch": batch},
+                )
+                break  # No point trying more batches
             except HttpError as exc:
                 logger.error(
                     "Batch fetch failed — skipping batch",

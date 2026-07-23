@@ -23,6 +23,17 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+# Import the key pool manager for multi-key quota rotation
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+try:
+    from youtube_extractor.key_pool import APIKeyPool, AllKeysExhaustedError
+except ImportError:
+    # Fallback: define minimal stubs if the module isn't on the path
+    # (e.g. in unit-test environments with a mocked DAG)
+    APIKeyPool = None  # type: ignore[assignment, misc]
+    AllKeysExhaustedError = Exception  # type: ignore[assignment, misc]
+
 log = logging.getLogger(__name__)
 
 # DAG Default Arguments
@@ -108,17 +119,26 @@ def extract_and_load_video_trends(postgres_conn_id: str = "youtube_postgres", **
     """
     Main logic: Collects the latest 50 videos from each channel 
     and inserts them into the database as new rows for trending analysis.
+    Uses APIKeyPool for automatic key rotation on quota exhaustion.
     """
-    api_key = os.environ.get("YOUTUBE_API_KEY", "")
     channel_ids_raw = os.environ.get("YOUTUBE_CHANNEL_IDS", "")
     # optional: project_category can be fetched from the environment or an Airflow variable
     proj_cat = os.environ.get("PROJECT_CATEGORY", "Data Science & AI") 
 
-    if not api_key or not channel_ids_raw:
-        raise ValueError("YOUTUBE_API_KEY and YOUTUBE_CHANNEL_IDS environment variables must be set.")
+    if not channel_ids_raw:
+        raise ValueError("YOUTUBE_CHANNEL_IDS environment variable must be set.")
+
+    # Initialise the API key pool (reads YOUTUBE_API_KEYS or YOUTUBE_API_KEY)
+    if APIKeyPool is not None:
+        pool = APIKeyPool.from_env()
+    else:
+        # Fallback to single-key mode if key_pool module isn't available
+        api_key = os.environ.get("YOUTUBE_API_KEY", "")
+        if not api_key:
+            raise ValueError("YOUTUBE_API_KEY environment variable must be set.")
+        pool = None
 
     channel_ids = [cid.strip() for cid in channel_ids_raw.split(",") if cid.strip()]
-    youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
     
     captured_time = datetime.now(timezone.utc).isoformat()
     all_video_records: List[Dict[str, Any]] = []
@@ -126,8 +146,18 @@ def extract_and_load_video_trends(postgres_conn_id: str = "youtube_postgres", **
     for channel_id in channel_ids:
         log.info(r"Processing channel ID: %s", channel_id)
         try:
-            # 1. Fetch the 'Uploads' Playlist ID of the channel
-            ch_response = youtube.channels().list(part="contentDetails", id=channel_id).execute()
+            if pool is not None:
+                # Use key pool with automatic rotation on quota errors
+                # 1. Fetch the 'Uploads' Playlist ID of the channel
+                ch_response = pool.execute_with_rotation(
+                    lambda svc, cid=channel_id: svc.channels().list(
+                        part="contentDetails", id=cid
+                    )
+                )
+            else:
+                youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
+                ch_response = youtube.channels().list(part="contentDetails", id=channel_id).execute()
+
             items = ch_response.get("items", [])
             if not items:
                 log.warning(r"Channel not found or no content details for: %s", channel_id)
@@ -136,11 +166,20 @@ def extract_and_load_video_trends(postgres_conn_id: str = "youtube_postgres", **
             uploads_playlist_id = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
 
             # 2. Get the IDs of the latest 50 videos from that Playlist
-            playlist_response = youtube.playlistItems().list(
-                part="contentDetails",
-                playlistId=uploads_playlist_id,
-                maxResults=50
-            ).execute()
+            if pool is not None:
+                playlist_response = pool.execute_with_rotation(
+                    lambda svc, pid=uploads_playlist_id: svc.playlistItems().list(
+                        part="contentDetails",
+                        playlistId=pid,
+                        maxResults=50
+                    )
+                )
+            else:
+                playlist_response = youtube.playlistItems().list(
+                    part="contentDetails",
+                    playlistId=uploads_playlist_id,
+                    maxResults=50
+                ).execute()
 
             video_ids = [item["contentDetails"]["videoId"] for item in playlist_response.get("items", [])]
             if not video_ids:
@@ -149,10 +188,18 @@ def extract_and_load_video_trends(postgres_conn_id: str = "youtube_postgres", **
 
             # 3. Get detailed metadata for the 50 video IDs (Batch Request)
             # YouTube API allows up to 50 IDs in a single video list call
-            video_response = youtube.videos().list(
-                part="snippet,statistics,contentDetails,status,topicDetails",
-                id=",".join(video_ids)
-            ).execute()
+            if pool is not None:
+                video_response = pool.execute_with_rotation(
+                    lambda svc, vids=video_ids: svc.videos().list(
+                        part="snippet,statistics,contentDetails,status,topicDetails",
+                        id=",".join(vids)
+                    )
+                )
+            else:
+                video_response = youtube.videos().list(
+                    part="snippet,statistics,contentDetails,status,topicDetails",
+                    id=",".join(video_ids)
+                ).execute()
 
             # 4. Data Preprocessing (Structuring data to fit the database)
             for v_item in video_response.get("items", []):
@@ -197,10 +244,11 @@ def extract_and_load_video_trends(postgres_conn_id: str = "youtube_postgres", **
                 }
                 all_video_records.append(record)
 
+        except AllKeysExhaustedError:
+            log.error("All API keys exhausted — aborting extraction for remaining channels.")
+            break  # Stop processing further channels
         except HttpError as exc:
             log.error(r"YouTube API error for channel %s: %s", channel_id, exc)
-            if exc.resp.status == 403:
-                raise # Fail the entire task if the Quota is exhausted
             continue
 
     # 5. Insert all data into PostgreSQL (Insert New Rows)
