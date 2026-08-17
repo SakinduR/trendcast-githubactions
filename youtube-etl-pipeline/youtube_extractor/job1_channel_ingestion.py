@@ -2,7 +2,7 @@
 ================================================================================
 job1_channel_ingestion.py — Standalone Script (GitHub Actions)
 ================================================================================
-Schedule  : Every 12 hours (0 */12 * * *)
+Schedule  : Every 15 minutes (*/15 * * * *)
 Purpose   : Read active YouTube channel seeds from Supabase PostgreSQL,
             discover REAL recent uploads via YouTube Data API v3, and upsert
             the latest videos into the polling queue.

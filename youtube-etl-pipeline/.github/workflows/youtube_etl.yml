@@ -2,8 +2,8 @@ name: YouTube ETL Pipeline
 
 on:
   schedule:
-    # Job 1 — Channel Ingestion: every 12 hours
-    - cron: '0 */12 * * *'
+    # Job 1 — Channel Ingestion: every 15 minutes
+    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       job:
@@ -23,14 +23,14 @@ env:
 
 jobs:
   # =========================================================================
-  # Job 1 — Channel Ingestion (runs every 12 hours)
+  # Job 1 — Channel Ingestion (runs every 15 minutes)
   # =========================================================================
   channel_ingestion:
     name: "Job 1 — Channel Ingestion"
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'both' || github.event.inputs.job == 'job1_channel_ingestion')
-      || github.event.schedule == '0 */12 * * *'
+      || github.event.schedule == '*/15 * * * *'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
