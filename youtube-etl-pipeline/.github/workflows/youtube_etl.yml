@@ -1,9 +1,14 @@
 name: YouTube ETL Pipeline
 
 on:
-  schedule:
-    # Job 1 — Channel Ingestion: every 15 minutes
-    - cron: '*/15 * * * *'
+  # Schedule disabled 2026-09-24: this pipeline writes to a Supabase project
+  # that has hit its free-tier quota and is being retired. Superseded by
+  # TrendCast-LK/trendcast-githubactions. workflow_dispatch kept so this can
+  # still be run by hand if ever needed. Re-enable the schedule below only
+  # if this pipeline is intentionally revived.
+  # schedule:
+  #   # Job 1 — Channel Ingestion: every 15 minutes
+  #   - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       job:
